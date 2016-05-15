@@ -1,24 +1,13 @@
 package pl.joegreen.charles;
 
-import java.io.IOException;
-import java.text.SimpleDateFormat;
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.Collection;
-import java.util.Date;
-import java.util.HashMap;
-import java.util.HashSet;
-import java.util.List;
-import java.util.Map;
-import java.util.Optional;
-import java.util.Set;
-import java.util.stream.Collectors;
-
-import javax.script.ScriptException;
-
+import com.fasterxml.jackson.core.JsonParseException;
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.JsonMappingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.google.common.collect.ImmutableList;
+import com.google.common.collect.ImmutableMap;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-
 import pl.joegreen.charles.communication.EdwardApiWrapper;
 import pl.joegreen.charles.configuration.CodeReader;
 import pl.joegreen.charles.configuration.EdwardApiConfiguration;
@@ -29,13 +18,13 @@ import pl.joegreen.charles.executor.exception.CannotExecuteFunctionException;
 import pl.joegreen.charles.executor.exception.CannotInitializeExecutorException;
 import pl.joegreen.edward.rest.client.RestException;
 
-import com.fasterxml.jackson.core.JsonParseException;
-import com.fasterxml.jackson.core.JsonProcessingException;
-import com.fasterxml.jackson.databind.JsonMappingException;
-import com.fasterxml.jackson.databind.ObjectMapper;
-import com.google.common.collect.ImmutableList;
-import com.google.common.collect.ImmutableList.Builder;
-import com.google.common.collect.ImmutableMap;
+import javax.script.ScriptException;
+import java.io.IOException;
+import java.text.SimpleDateFormat;
+import java.util.*;
+import java.util.stream.Collectors;
+
+import static com.google.common.collect.Lists.newArrayList;
 
 public class Charles {
 
@@ -87,18 +76,40 @@ public class Charles {
 		return populations;
 	}
 
-	private List<Population> improveAndMigrateSynchronously(List<Population> populations) throws CannotExecuteFunctionException, RestException, IOException {
+	private List<Population> improveAndMigrateSynchronously(List<Population> populations)
+			throws CannotExecuteFunctionException, RestException, IOException {
+
+        // Use linked list so as to be able to remove from it w/o any errors ;)
+        List<Population> linkedPopulations = new LinkedList<>(populations);
 		for (int i = 0; i < configuration.getMetaIterationsCount(); ++i) {
-			logger.info("Performing meta iteration " + i);
-			if (i > 0) {
-				populations = migratePopulationsLocally(populations);
+            logger.info("Performing meta iteration " + i);
+            Long volunteersPopulationsDelta = edwardApiWrapper.getVolunteersCount() - linkedPopulations.size();
+            if (volunteersPopulationsDelta > 0) {
+                for (int j = 0; j < volunteersPopulationsDelta; j++) {
+					// TODO: extract method
+                    Map<Object, Object> phaseParameters = configuration
+                            .getPhaseConfiguration(PhaseType.GENERATE).getParameters();
+                    Population generatedPopulation = new Population(
+                            localExecutor.executeFunction(
+                                    PhaseType.GENERATE.toFunctionName(),
+                                    phaseParameters));
+					linkedPopulations.add(generatedPopulation);
+                }
+            } else {
+                for (int j = 0; j < Math.abs(volunteersPopulationsDelta) && linkedPopulations.size() > 0; j++) {
+					linkedPopulations.remove(0);
+                }
+            }
+
+            if (i > 0) {
+				linkedPopulations = migratePopulationsLocally(linkedPopulations);
 			}
-			populations = improvePopulationsRemotely(populations);
+			linkedPopulations = improvePopulationsRemotely(linkedPopulations);
             if (logger.isTraceEnabled()) {
-                logger.trace("Improved populations: \n {} ", populationsToString(populations));
+                logger.trace("Improved populations: \n {} ", populationsToString(linkedPopulations));
             }
         }
-		return populations;
+		return linkedPopulations;
 	}
 
 	private void improveAndMigrateAsynchronously(List<Population> populations) throws RestException, IOException {
@@ -209,17 +220,17 @@ public class Charles {
 	private List<Population> generatePopulationsLocally()
 			throws CannotExecuteFunctionException {
 		logger.info("Generating populations locally");
-		ImmutableList.Builder<Population> listBuilder = new Builder<Population>();
-		for (int i = 0; i < configuration.getPopulationsCount(); ++i) {
+		List<Population> populations = newArrayList();
+		for (int i = 0; i < edwardApiWrapper.getVolunteersCount(); ++i) {
 			Map<Object, Object> phaseParameters = configuration
 					.getPhaseConfiguration(PhaseType.GENERATE).getParameters();
 			Population generatedPopulation = new Population(
 					localExecutor.executeFunction(
 							PhaseType.GENERATE.toFunctionName(),
 							phaseParameters));
-			listBuilder.add(generatedPopulation);
+			populations.add(generatedPopulation);
 		}
-		return listBuilder.build();
+		return populations;
 	}
 
 	private List<Population> improvePopulationsRemotely(
@@ -270,9 +281,9 @@ public class Charles {
 					results);
 		}
         logger.info("Waiting for improved populations took {} ms ", System.currentTimeMillis() - startTime);
-        return ImmutableList.copyOf(taskIdentifiers.stream()
+        return taskIdentifiers.stream()
 				.map(results::get)
-				.collect(Collectors.toList()));
+				.collect(Collectors.toList());
 	}
 
 	private void retrieveImprovedPopulations(Collection<Long> taskIdentifiers,
@@ -318,22 +329,51 @@ public class Charles {
 	}
 
 	private List<Population> migratePopulationsLocally(
-			Collection<Population> populations)
+			List<Population> populations)
 			throws CannotExecuteFunctionException {
 		logger.info("Migrating populations locally");
 		long startTime = System.currentTimeMillis();
+
 		Collection<Map<Object, Object>> representations = populations.stream()
 				.map(Population::getMapRepresentation)
 				.collect(Collectors.toList());
-		Map<Object, Object> argument = addOptionsToArgument(representations,
-				"populations", PhaseType.MIGRATE);
-		Map<Object, Object> result = localExecutor.executeFunction(
-				PhaseType.MIGRATE.toFunctionName(), argument);
-		List<Map<Object, Object>> newPopulations = (List<Map<Object, Object>>) result
-				.get("populations");
-        logger.info("Migrating populations locally took {} ms", (System.currentTimeMillis() - startTime));
-        return newPopulations.stream().map(asMap -> new Population(asMap))
-				.collect(Collectors.toCollection(ArrayList::new));
+
+        logger.info("Populations before migrate: " + representations);
+
+		Map<Object, Object> functionArguments;
+		Map<Object, Object> functionResult;
+		//List<Map<Object, Object>> newPopulations = new ArrayList<>();
+		for (Map<Object, Object> firstPopulation : representations) {
+			for (Map<Object, Object> secondPopulation : representations) {
+				if (!firstPopulation.equals(secondPopulation)) {
+					functionArguments = new HashMap<>();
+					functionArguments.put("firstPopulation", firstPopulation);
+					functionArguments.put("secondPopulation", secondPopulation);
+
+					// Add config
+					functionArguments.put("parameters", configuration.getPhaseConfiguration(PhaseType.MIGRATE)
+							.getParameters());
+
+					// Execute migrate.js
+					functionResult = localExecutor.executeFunction(
+							PhaseType.MIGRATE.toFunctionName(), functionArguments);
+
+					// 'Parse' response
+					firstPopulation.clear();
+					firstPopulation.putAll((Map<Object, Object>) ((Map<Object, Object>) functionResult
+							.get("populations")).get("firstPopulation"));
+					secondPopulation.clear();
+					secondPopulation.putAll((Map<Object, Object>) ((Map<Object, Object>) functionResult
+							.get("populations")).get("secondPopulation"));
+				}
+			}
+		}
+
+
+        logger.info("Populations after migrate:  " + representations);
+
+		logger.info("Migrating populations locally took {} ms", (System.currentTimeMillis() - startTime));
+        return populations;
 	}
 
 	public static String toPrettyJsonString(Map<Object, Object> map) {
